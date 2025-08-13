@@ -1,0 +1,42 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Deck Controller</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 16px; }
+    #status { margin-bottom: 12px; }
+    .hand { display:flex; gap:8px; flex-wrap:wrap; }
+    button.card { padding:12px 16px; border-radius:8px; border:1px solid #ccc; }
+    .row { margin: 8px 0; }
+    input, select, button { font-size: 16px; }
+  </style>
+</head>
+<body>
+  <h2>Deck Controller</h2>
+  <div id="status">Not connected</div>
+
+  <div class="row">
+    <label>Name: <input id="name" placeholder="Player" /></label>
+    <button id="claim">Join</button>
+    <button id="start">Start Run</button>
+  </div>
+
+  <div class="row"><strong>Enemies:</strong></div>
+  <div id="enemies"></div>
+
+  <div class="row">
+    <label>Target:
+      <select id="target">
+        <option value="none">none</option>
+      </select>
+    </label>
+  </div>
+
+  <div class="row"><strong>Your hand:</strong></div>
+  <div class="hand" id="hand"></div>
+
+  <script src="/client.js?v=3" defer></script>
+</body>
+</html>

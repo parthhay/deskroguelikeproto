@@ -1,0 +1,6 @@
+[gd_scene load_steps=2 format=3 uid="uid://cc5k36wfouw37"]
+
+[ext_resource type="Script" uid="uid://de6jilc8rnogj" path="res://scripts/NetworkHost.gd" id="1_elqb8"]
+
+[node name="GameHost" type="Node"]
+script = ExtResource("1_elqb8")
