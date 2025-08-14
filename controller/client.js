@@ -1,6 +1,5 @@
-console.log('client.js v7 loaded');
-
 (() => {
+  console.log('client.js v9 (WS + HTTP fallback)');
   const status = document.getElementById('status');
   const enemiesEl = document.getElementById('enemies');
   const handEl = document.getElementById('hand');
@@ -14,158 +13,100 @@ console.log('client.js v7 loaded');
   let turnPlayer = null;
   let runOver = false;
 
-  // --- HTTP helper: always parse JSON, even on errors
-  async function api(path, opts = {}) {
+  // --- HTTP helpers ---
+  async function api(path, opts={}) {
     const res = await fetch(path, Object.assign({ headers: {'Content-Type':'application/json'} }, opts));
-    let payload = null;
-    try { payload = await res.json(); } catch(_) { /* no-op */ }
-    if (!res.ok) {
-      const code = payload && payload.error ? payload.error : ('HTTP ' + res.status);
-      const err = new Error(code);
-      err.payload = payload;
-      throw err;
-    }
-    return payload || {};
+    const data = await res.json().catch(()=> ({}));
+    if (!res.ok) throw new Error(data && data.error ? data.error : ('HTTP '+res.status));
+    return data;
   }
 
-  function requiresEnemyTarget(card) {
-    return card === 'Strike' || card === 'Zap';
-  }
+  // --- WebSocket overlay ---
+  let ws = null;
+  let wsOpen = false;
+  let reconnectTimer = null;
 
-  function fmtSlot(s) {
-    if (!s || !s.occupied) return '—';
-    return s.name || 'Player';
-  }
-
-  function setStatus(text) {
-    status.textContent = text;
-  }
-
-  async function refreshLobby() {
+  function connectWS() {
     try {
-      const data = await api('/lobby');
-      const slots = data.slots || {};
-      const lobbyStr = `Lobby: [1] ${fmtSlot(slots['1'])} | [2] ${fmtSlot(slots['2'])} | [3] ${fmtSlot(slots['3'])}`;
-      // Don’t overwrite turn/run status if we already have it
-      if (playerId == null) setStatus(lobbyStr);
-    } catch {
-      if (playerId == null) setStatus('Can’t reach host.');
-    }
-  }
+      const host = location.hostname;
+      const url = `ws://${host}:8081`;
+      ws = new WebSocket(url);
 
-  async function claim() {
-    try {
-      const data = await api('/claim', {
-        method: 'POST',
-        body: JSON.stringify({ name: (nameEl.value || 'Player').slice(0,20) })
+      ws.addEventListener('open', () => {
+        wsOpen = true;
+        console.log('[WS] open', url);
+        if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+        // If we already have a name, we can claim on click; nothing to send yet.
       });
-      playerId = data.player_id;
-      token = data.token;
-      renderHand(data.hand || []);
-      await refreshState();
-    } catch (e) {
-      alert('Join failed (lobby full or host down).');
-    }
-  }
 
-  async function startRun() {
-    console.log('[CLIENT] Start button clicked');
-    try {
-      // optimistic UI so it feels responsive
-      startBtn.textContent = 'Restart Run';
-      targetEl.value = 'none';
-      await api('/start', { method: 'POST', body: JSON.stringify({ player_id: playerId || 0 }) });
-      console.log('[CLIENT] /start succeeded');
-      await refreshState();
-    } catch (e) {
-      console.warn('[CLIENT] /start failed', e);
-      alert('Could not start run.');
-      // revert label if needed
-      startBtn.textContent = 'Start Run';
-    }
-  }
-
-  async function refreshState() {
-    try {
-      const data = await api(`/state?player_id=${playerId || 0}`);
-      turnPlayer = data.turn_player;
-      runOver = !!data.run_over;
-
-      renderEnemies(data.enemies || []);
-      renderTargets(data.enemies || []);
-      renderHand(data.your_hand || []);
-
-      const yourTurn = (turnPlayer === playerId);
-      const waveStr = data.wave ? ` — Wave ${data.wave}` : '';
-      const piles = (data.deck_count != null && data.discard_count != null)
-        ? ` — Deck ${data.deck_count} / Discard ${data.discard_count}` : '';
-      const ro = runOver ? ' (Run Over)' : '';
-
-      // Label the button
-      startBtn.textContent = runOver ? 'Restart Run' : 'Start Run';
-
-      setStatus(
-        (playerId
-          ? (yourTurn ? `Your turn (P${playerId})` : `Waiting… It’s Player ${turnPlayer}’s turn`)
-          : 'Not joined') + waveStr + ro + piles
-      );
-    } catch {
-      // ignore; polling will recover
-    }
-  }
-
-  async function play(card) {
-    if (!playerId || !token || runOver) return;
-
-    // If the card needs a target and none is selected, auto-pick the first enemy.
-    let target = targetEl.value;
-    if (requiresEnemyTarget(card) && (!target || target === 'none')) {
-      // Ask the server what enemies are currently alive to avoid stale UI.
-      try {
-        const state = await api(`/state?player_id=${playerId}`);
-        const firstEnemy = (state.enemies || [])[0];
-        if (!firstEnemy) {
-          alert('No enemy to target.');
-          return;
-        }
-        target = `enemy_${firstEnemy.id}`;
-        // reflect in UI so the user sees the choice
-        targetEl.value = target;
-      } catch {
-        alert('Could not fetch state to auto-select a target.');
-        return;
-      }
-    }
-
-    try {
-      const data = await api('/play_card', {
-        method: 'POST',
-        body: JSON.stringify({ player_id: playerId, token, card, target })
+      ws.addEventListener('message', (ev) => {
+        let msg = {};
+        try { msg = JSON.parse(ev.data); } catch { return; }
+        handleWS(msg);
       });
-      // Update local state from server response
-      turnPlayer = data.turn_player;
-      runOver = !!data.run_over;
-      renderEnemies(data.enemies || []);
-      renderTargets(data.enemies || []);
-      renderHand(data.your_hand || []);
-      const yourTurn = (turnPlayer === playerId);
-      const waveStr = data.wave ? ` — Wave ${data.wave}` : '';
-      const ro = runOver ? ' (Run Over)' : '';
-      setStatus((yourTurn ? `Your turn (P${playerId})` : `Waiting… It’s Player ${turnPlayer}’s turn`) + waveStr + ro);
+
+      ws.addEventListener('close', () => {
+        console.log('[WS] closed; falling back to HTTP');
+        wsOpen = false;
+        reconnectTimer = setTimeout(connectWS, 2000);
+      });
+
+      ws.addEventListener('error', () => {
+        console.log('[WS] error');
+      });
     } catch (e) {
-      const code = e && e.message ? e.message : 'play_failed';
-      // Server may respond with structured error codes like not_your_turn / bad_token / need_enemy_target.
-      alert('Play failed: ' + code);
-      await refreshState();
+      console.log('[WS] connect error', e);
     }
+  }
+
+  function wssend(obj) {
+    if (wsOpen && ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(obj));
+      return true;
+    }
+    return false;
+  }
+
+  function handleWS(msg) {
+    switch (msg.type) {
+      case 'welcome':
+        break;
+      case 'claim_ok':
+        playerId = msg.player_id;
+        token = msg.token;
+        renderHand(msg.hand || []);
+        break;
+      case 'state':
+        applyState(msg);
+        break;
+      case 'error':
+        alert('WS error: ' + msg.code);
+        break;
+    }
+  }
+
+  // --- UI/state ---
+  function requiresEnemyTarget(card) { return card === 'Strike' || card === 'Zap'; }
+  function setStatus(text) { status.textContent = text; }
+
+  function applyState(st) {
+    // st has turn_player, your_hand, players, enemies, run_over, wave, deck_count, discard_count
+    turnPlayer = st.turn_player;
+    runOver = !!st.run_over;
+    renderEnemies(st.enemies || []);
+    renderTargets(st.enemies || []);
+    renderHand(st.your_hand || []);
+    const yourTurn = (turnPlayer === playerId);
+    const waveStr = st.wave ? ` — Wave ${st.wave}` : '';
+    const piles = (st.deck_count!=null && st.discard_count!=null) ? ` — Deck ${st.deck_count} / Discard ${st.discard_count}` : '';
+    const ro = runOver ? ' (Run Over)' : '';
+    startBtn.textContent = runOver ? 'Restart Run' : 'Start Run';
+    setStatus((playerId ? (yourTurn ? `Your turn (P${playerId})` : `Waiting… It’s Player ${turnPlayer}’s turn`) : 'Not joined') + waveStr + ro + piles);
   }
 
   function renderEnemies(enemies) {
     enemiesEl.innerHTML = '';
-    if (!enemies.length) {
-      enemiesEl.textContent = '(No enemies on field)';
-      return;
-    }
+    if (!enemies.length) { enemiesEl.textContent = '(No enemies on field)'; return; }
     enemies.forEach(e => {
       const div = document.createElement('div');
       const bossTag = e.is_boss ? ` [BOSS: ${e.phase}]` : '';
@@ -177,19 +118,15 @@ console.log('client.js v7 loaded');
   function renderTargets(enemies) {
     const current = targetEl.value;
     targetEl.innerHTML = '';
-    const none = document.createElement('option');
-    none.value = 'none';
-    none.textContent = 'none';
+    const none = document.createElement('option'); none.value = 'none'; none.textContent = 'none';
     targetEl.appendChild(none);
     enemies.forEach(e => {
       const opt = document.createElement('option');
       opt.value = `enemy_${e.id}`;
-      opt.textContent = `${e.name}`;
+      opt.textContent = e.name;
       targetEl.appendChild(opt);
     });
-    // keep previous selection if still valid; else leave "none"
-    const opts = Array.from(targetEl.options).map(o => o.value);
-    if (opts.includes(current)) targetEl.value = current;
+    if (Array.from(targetEl.options).some(o => o.value === current)) targetEl.value = current;
   }
 
   function renderHand(cards) {
@@ -211,9 +148,61 @@ console.log('client.js v7 loaded');
     }
   }
 
+  // --- Actions (WS first, HTTP fallback) ---
+  async function claim() {
+    const nm = (nameEl.value || 'Player').slice(0,20);
+    if (wssend({type:'claim', name:nm})) return;
+    // HTTP fallback
+    const data = await api('/claim', { method:'POST', body: JSON.stringify({name: nm}) });
+    playerId = data.player_id; token = data.token;
+    renderHand(data.hand || []); await refreshState();
+  }
+
+  async function startRun() {
+    // optimistic label
+    startBtn.textContent = 'Restart Run';
+    targetEl.value = 'none';
+    if (wssend({type:'start'})) return; // WS will push a state to us
+    // HTTP fallback
+    await api('/start', { method: 'POST', body: JSON.stringify({ player_id: playerId || 0 }) });
+    await refreshState();
+  }
+
+  async function play(card) {
+    if (!playerId || !token || runOver) return;
+    let target = targetEl.value;
+    if (requiresEnemyTarget(card) && (!target || target === 'none')) {
+      // pick first enemy via quick state fetch fallback
+      try {
+        const st = await api(`/state?player_id=${playerId}`);
+        const first = (st.enemies || [])[0];
+        if (first) { target = `enemy_${first.id}`; targetEl.value = target; }
+        else { alert('No enemy to target.'); return; }
+      } catch { /* ignore */ }
+    }
+    if (wssend({type:'play_card', player_id: playerId, token, card, target})) return;
+    // HTTP fallback
+    try {
+      const st = await api('/play_card', { method:'POST', body: JSON.stringify({ player_id: playerId, token, card, target }) });
+      applyState(st);
+    } catch (e) {
+      alert('Play failed: ' + e.message);
+      await refreshState();
+    }
+  }
+
+  // --- HTTP polling stays as a backup ---
+  async function refreshState() {
+    const st = await api(`/state?player_id=${playerId || 0}`);
+    applyState(st);
+  }
+
+  // Wire buttons
   claimBtn.addEventListener('click', claim);
   startBtn.addEventListener('click', startRun);
-  refreshLobby();
-  setInterval(refreshLobby, 4000);
-  setInterval(refreshState, 1800);
+
+  // Boot
+  connectWS();
+  setInterval(refreshState, 2000); // fallback if WS isn’t pushing
+  // Lobby polling can stay if you want; state covers it now
 })();
