@@ -151,6 +151,7 @@ func _parse_http_request(buf: PackedByteArray) -> Dictionary:
 func _handle_request(req: Dictionary) -> PackedByteArray:
 	var method: String = req["method"]
 	var path: String = req["path"]
+
 	match method:
 		"GET":
 			if path == "/" or path == "/index.html":
@@ -164,27 +165,42 @@ func _handle_request(req: Dictionary) -> PackedByteArray:
 				var pid := int(qp.get("player_id", "0"))
 				return _json_ok({"player_id": pid, "hand": _hands.get(pid, [])})
 			if path == "/state":
-				var qp := _parse_query(String(req["query"]))
-				var pid := int(qp.get("player_id", "0"))
-				return _json_ok(_state_payload(pid))
+				var qp2 := _parse_query(String(req["query"]))
+				var pid2 := int(qp2.get("player_id", "0"))
+				return _json_ok(_state_payload(pid2))
+			if path == "/start": # ← handy test via address bar
+				print("[HTTP] GET /start")
+				_start_run()
+				var qp3 := _parse_query(String(req["query"]))
+				var pid3 := int(qp3.get("player_id", "0"))
+				return _json_ok(_state_payload(pid3))
 			return _not_found()
+
 		"POST":
 			var body: Dictionary = {}
-			if (req["body"] as PackedByteArray).size() > 0:
-				body = JSON.parse_string((req["body"] as PackedByteArray).get_string_from_utf8())
-				if typeof(body) != TYPE_DICTIONARY:
+			var has_body := (req["body"] as PackedByteArray).size() > 0
+			if has_body:
+				var parsed = JSON.parse_string((req["body"] as PackedByteArray).get_string_from_utf8())
+				if typeof(parsed) == TYPE_DICTIONARY:
+					body = parsed
+				else:
 					return _json_bad({"error":"bad_json"})
+
 			if path == "/claim":
 				var player_name := String(body.get("name","Player")).substr(0, 20)
 				return _claim(player_name, req)
+
 			if path == "/play_card":
 				return _play_card(body, req)
+
 			if path == "/start":
+				print("[HTTP] POST /start")
 				_start_run()
-				# optional: read pid from body for a personalized state
 				var bpid := int(body.get("player_id", 0))
 				return _json_ok(_state_payload(bpid))
+
 			return _not_found()
+
 		_:
 			return _json_bad({"error":"method_not_allowed"})
 
@@ -211,15 +227,16 @@ func _http_ok(mime: String, body: PackedByteArray) -> PackedByteArray:
 	return _http_resp(200, "OK", mime, body)
 
 func _http_resp(code: int, reason: String, mime: String, body: PackedByteArray) -> PackedByteArray:
-	var headers := "HTTP/1.1 %d %s\r\n" \
-	+ "Content-Type: %s\r\n" \
-	+ "Content-Length: %d\r\n" \
-	+ "Connection: close\r\n" \
-	+ "Access-Control-Allow-Origin: *\r\n" \
-	+ "Cache-Control: no-store, must-revalidate\r\n" \
-	+ "Pragma: no-cache\r\n" \
-	+ "Expires: 0\r\n\r\n" % [code, reason, mime, body.size()]
-	var head_bytes := headers.to_utf8_buffer()
+	var headers := "HTTP/1.1 " + str(code) + " " + reason + "\r\n" \
+		+ "Content-Type: " + mime + "\r\n" \
+		+ "Content-Length: " + str(body.size()) + "\r\n" \
+		+ "Connection: close\r\n" \
+		+ "Access-Control-Allow-Origin: *\r\n" \
+		+ "Cache-Control: no-store, must-revalidate\r\n" \
+		+ "Pragma: no-cache\r\n" \
+		+ "Expires: 0\r\n\r\n"
+
+	var head_bytes: PackedByteArray = headers.to_utf8_buffer()
 	var out := PackedByteArray()
 	out.append_array(head_bytes)
 	out.append_array(body)
@@ -289,25 +306,34 @@ func _play_card(body: Dictionary, _req: Dictionary) -> PackedByteArray:
 		"Strike":
 			var eid: int = _parse_enemy_tag(target)
 			if eid == -1:
-				return _json_bad({"error":"need_enemy_target"})
+				eid = _first_enemy_id()
+				if eid == -1:
+					return _json_bad({"error":"need_enemy_target"})
 			_damage_enemy(eid, 6)
+
 		"Zap":
 			var zeid: int = _parse_enemy_tag(target)
 			if zeid == -1:
-				return _json_bad({"error":"need_enemy_target"})
+				zeid = _first_enemy_id()
+				if zeid == -1:
+					return _json_bad({"error":"need_enemy_target"})
 			_damage_enemy(zeid, 4)
+
 		"Shield":
 			_add_shield(pid, 5)
+
 		"Heal":
 			_heal_player(pid, 5)
+
 		"Shield All":
-			for apid in [1, 2, 3]:
+			for apid in [1,2,3]:
 				if _player_slots[apid] != null and bool(_players[apid]["alive"]):
 					_add_shield(apid, 5)
+
 		"Draw":
 			_draw(pid, 2)
+
 		_:
-			# unimplemented -> consume anyway
 			pass
 
 	# ---- Consume: move from hand -> discard (single instance) ----
@@ -376,7 +402,7 @@ func _state_payload(pid: int) -> Dictionary:
 		"players": _players,
 		"enemies": _enemies,
 		"run_over": _run_over,
-		"wave": _wave_index + 1,   # ← uses _wave_index
+		"wave": _wave_index + 1,
 		"slots": _slots_payload(),
 		"deck_count": _decks.get(pid, []).size(),
 		"discard_count": _discards.get(pid, []).size(),
@@ -468,6 +494,7 @@ func _spawn_enemy(enemy_name: String, hp: int) -> void:
 	_enemies.append({"id": _enemy_id_seq, "name": enemy_name, "hp": hp, "max_hp": hp})
 
 func _start_run() -> void:
+	print("[HTTP] _start_run called")
 	_enemies.clear()
 	_enemy_id_seq = 0
 	_run_over = false
@@ -475,13 +502,15 @@ func _start_run() -> void:
 	_boss_spawned = false
 	_build_waves()
 	_spawn_wave(_wave_index)
-	# reset players...
+	# reset players
 	for pid in [1,2,3]:
 		_players[pid]["hp"] = _players[pid]["max_hp"]
 		_players[pid]["shield"] = 0
 		_players[pid]["alive"] = true
+	# cards
 	_setup_decks()
 	_log_event({"type":"run_started","wave": _wave_index + 1})
+	print("[HTTP] _start_run finished — wave:", _wave_index + 1)
 
 func _find_enemy(eid: int) -> int:
 	for i in range(_enemies.size()):
@@ -636,3 +665,8 @@ func _draw(pid: int, n: int) -> void:
 			_shuffle_array(_decks[pid])
 		var card = _decks[pid].pop_back()
 		_hands[pid].append(card)
+
+func _first_enemy_id() -> int:
+	if _enemies.size() > 0:
+		return int(_enemies[0]["id"])
+	return -1

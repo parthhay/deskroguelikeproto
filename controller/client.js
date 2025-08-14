@@ -1,4 +1,5 @@
-console.log('client.js v3');
+console.log('client.js v7 loaded');
+
 (() => {
   const status = document.getElementById('status');
   const enemiesEl = document.getElementById('enemies');
@@ -68,11 +69,19 @@ console.log('client.js v3');
   }
 
   async function startRun() {
+    console.log('[CLIENT] Start button clicked');
     try {
+      // optimistic UI so it feels responsive
+      startBtn.textContent = 'Restart Run';
+      targetEl.value = 'none';
       await api('/start', { method: 'POST', body: JSON.stringify({ player_id: playerId || 0 }) });
+      console.log('[CLIENT] /start succeeded');
       await refreshState();
-    } catch {
+    } catch (e) {
+      console.warn('[CLIENT] /start failed', e);
       alert('Could not start run.');
+      // revert label if needed
+      startBtn.textContent = 'Start Run';
     }
   }
 
@@ -81,15 +90,27 @@ console.log('client.js v3');
       const data = await api(`/state?player_id=${playerId || 0}`);
       turnPlayer = data.turn_player;
       runOver = !!data.run_over;
+
       renderEnemies(data.enemies || []);
       renderTargets(data.enemies || []);
       renderHand(data.your_hand || []);
+
       const yourTurn = (turnPlayer === playerId);
       const waveStr = data.wave ? ` — Wave ${data.wave}` : '';
+      const piles = (data.deck_count != null && data.discard_count != null)
+        ? ` — Deck ${data.deck_count} / Discard ${data.discard_count}` : '';
       const ro = runOver ? ' (Run Over)' : '';
-      setStatus((playerId ? (yourTurn ? `Your turn (P${playerId})` : `Waiting… It’s Player ${turnPlayer}’s turn`) : 'Not joined') + waveStr + ro);
+
+      // Label the button
+      startBtn.textContent = runOver ? 'Restart Run' : 'Start Run';
+
+      setStatus(
+        (playerId
+          ? (yourTurn ? `Your turn (P${playerId})` : `Waiting… It’s Player ${turnPlayer}’s turn`)
+          : 'Not joined') + waveStr + ro + piles
+      );
     } catch {
-      // ignore brief errors; polling will catch up
+      // ignore; polling will recover
     }
   }
 
@@ -191,7 +212,7 @@ console.log('client.js v3');
   }
 
   claimBtn.addEventListener('click', claim);
-  startBtn.addEventListener('click', startRun);
+  startBtn.textContent = runOver ? 'Restart Run' : 'Start Run';
   refreshLobby();
   setInterval(refreshLobby, 4000);
   setInterval(refreshState, 1800);
