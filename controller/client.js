@@ -212,7 +212,7 @@ console.log('client.js v7 loaded');
   }
 
   claimBtn.addEventListener('click', claim);
-  startBtn.textContent = runOver ? 'Restart Run' : 'Start Run';
+  startBtn.addEventListener('click', startRun);
   refreshLobby();
   setInterval(refreshLobby, 4000);
   setInterval(refreshState, 1800);
