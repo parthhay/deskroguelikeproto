@@ -3,13 +3,14 @@ extends Node
 const HTTP_PORT := 8080
 const CONTROLLER_ROOT := "res://controller"
 const LAN_IP_OVERRIDE := "" # e.g. "192.168.1.42" to force a specific IP (optional)
-
+const WS_PORT := 8081
 const START_HAND := 5
 const DRAW_PER_TURN := 1
 
 var _server := TCPServer.new()
 var _conns: Array = []  # each: { "peer": StreamPeerTCP, "buf": PackedByteArray }
-
+var _ws: Object = null            # WebSocketServer instance, if available
+var _ws_clients: Dictionary = {}  # peer_id -> { "player_id": int, "token": String }
 
 # Card piles
 var _hands := {1: [], 2: [], 3: []}      # replace your old contents with empty arrays
@@ -24,6 +25,7 @@ var _base_deck: Array = [
 	"Shield All",
 	"Draw" # <- new effect: draw 2
 ]
+var _state_ver: int = 0
 var _boss_spawned: bool = false
 # player/session state
 var _player_slots := {1:null, 2:null, 3:null} # slot -> peer_id (string)
@@ -55,13 +57,21 @@ func _ready() -> void:
 		return
 	print("HTTP listening on:", HTTP_PORT)
 	_print_all_ips()
-	var ip := _preferred_lan_ip()
 	print("On THIS PC:                 http://localhost:%d/" % HTTP_PORT)
-	print("On OTHER devices (Wi-Fi):   http://%s:%d/" % [ip, HTTP_PORT])
+	print("On OTHER devices (Wi-Fi):   http://%s:%d/" % [_preferred_lan_ip(), HTTP_PORT])
+
+	_start_ws()
+	if _ws != null:
+		print("WebSocket endpoint: ws://%s:%d" % [_preferred_lan_ip(), WS_PORT])
+	else:
+		print("WebSocketServer unavailable; using HTTP only.")
+	_ws_probe()
+	_ws_probe_classes()
 
 func _process(_dt: float) -> void:
 	_accept_new()
 	_service_conns()
+	_poll_ws()
 
 func _accept_new() -> void:
 	if _server.is_connection_available():
@@ -188,10 +198,20 @@ func _handle_request(req: Dictionary) -> PackedByteArray:
 
 			if path == "/claim":
 				var player_name := String(body.get("name","Player")).substr(0, 20)
-				return _claim(player_name, req)
+				var res := _claim_dict(player_name)
+				if not bool(res.get("ok", false)):
+					return _json_bad({"error":res.get("error","unknown")})
+				return _json_ok({"player_id": res["player_id"], "hand": res.get("hand", []), "token": res["token"]})
 
 			if path == "/play_card":
-				return _play_card(body, req)
+				var pid := int(body.get("player_id", 0))
+				var tok := String(body.get("token",""))
+				var card := String(body.get("card",""))
+				var target := String(body.get("target","none"))
+				var r := _play_card_dict(pid, tok, card, target)
+				if not bool(r.get("ok", false)):
+					return _json_bad({"error": r.get("error","unknown")})
+				return _json_ok(r["state"])
 
 			if path == "/start":
 				print("[HTTP] POST /start")
@@ -376,6 +396,7 @@ func _log_event(ev: Dictionary) -> void:
 	_event_id += 1
 	ev["id"] = _event_id
 	_events.append(ev)
+	_state_ver += 1
 	if _events.size() > 256:
 		_events.pop_front()
 	print("[EVENT]", ev)
@@ -406,6 +427,7 @@ func _state_payload(pid: int) -> Dictionary:
 		"slots": _slots_payload(),
 		"deck_count": _decks.get(pid, []).size(),
 		"discard_count": _discards.get(pid, []).size(),
+		"ver": _state_ver,
 	}
 
 func _next_turn_or_enemy_phase() -> void:
@@ -457,6 +479,8 @@ func _enemy_phase() -> void:
 	if alive_pids.size() == 0:
 		_run_over = true
 		_log_event({"type":"run_ended","result":"lose"})
+	
+	_ws_broadcast_state()
 
 func _print_all_ips() -> void:
 	print("--- Local addresses ---")
@@ -511,6 +535,7 @@ func _start_run() -> void:
 	_setup_decks()
 	_log_event({"type":"run_started","wave": _wave_index + 1})
 	print("[HTTP] _start_run finished — wave:", _wave_index + 1)
+	_ws_broadcast_state()
 
 func _find_enemy(eid: int) -> int:
 	for i in range(_enemies.size()):
@@ -591,6 +616,7 @@ func _maybe_advance_wave_or_win() -> void:
 	# If boss already happened and now field is empty -> WIN
 	if _boss_spawned:
 		_run_over = true
+		_ws_broadcast_state()
 		_log_event({"type":"run_ended","result":"win"})
 		return
 
@@ -670,3 +696,224 @@ func _first_enemy_id() -> int:
 	if _enemies.size() > 0:
 		return int(_enemies[0]["id"])
 	return -1
+
+func _start_ws() -> void:
+	if not ClassDB.class_exists("WebSocketServer"):
+		print("WebSocketServer unavailable; using HTTP only.")
+		return
+
+	_ws = ClassDB.instantiate("WebSocketServer")
+	if _ws == null:
+		print("Failed to instance WebSocketServer.")
+		return
+
+	# listen( port: int, protocols: PackedStringArray = [], tls: bool = false )
+	var err: int = int(_ws.call("listen", WS_PORT, PackedStringArray(), false))
+	if err != OK:
+		push_error("WebSocket listen failed: %s" % err)
+		_ws = null
+		return
+
+	# Connect signals dynamically
+	_ws.connect("client_connected", Callable(self, "_on_ws_client_connected"))
+	_ws.connect("client_disconnected", Callable(self, "_on_ws_client_disconnected"))
+	print("WS listening on:", WS_PORT)
+
+func _poll_ws() -> void:
+	if _ws == null:
+		return
+
+	_ws.call("poll")
+
+	var peer_ids: Array = _ws.call("get_peer_ids")
+	for peer_id in peer_ids:
+		var peer: Object = _ws.call("get_peer", int(peer_id))
+		while int(peer.call("get_available_packet_count")) > 0:
+			var pkt: PackedByteArray = peer.call("get_packet")
+			var txt: String = pkt.get_string_from_utf8()
+			var msg = JSON.parse_string(txt)
+			if typeof(msg) == TYPE_DICTIONARY:
+				_handle_ws_message(int(peer_id), msg)
+
+func _on_ws_client_connected(peer_id: int, _protocol: String) -> void:
+	_ws_clients[peer_id] = {"player_id": 0, "token": ""}
+	_ws_send(peer_id, {"type":"welcome","msg":"connected"})
+
+func _on_ws_client_disconnected(peer_id: int, _was_clean: bool) -> void:
+	_ws_clients.erase(peer_id)
+
+func _ws_send(peer_id: int, d: Dictionary) -> void:
+	if _ws == null:
+		return
+	var has_peer: bool = bool(_ws.call("has_peer", peer_id))
+	if not has_peer:
+		return
+	var pkt: PackedByteArray = JSON.stringify(d).to_utf8_buffer()
+	var peer: Object = _ws.call("get_peer", peer_id)
+	peer.call("put_packet", pkt)
+
+func _ws_send_state(peer_id: int) -> void:
+	if _ws == null:
+		return
+	var pid: int = int(_ws_clients.get(peer_id, {}).get("player_id", 0))
+	var st: Dictionary = _state_payload(pid)
+	st["type"] = "state"
+	_ws_send(peer_id, st)
+
+func _ws_broadcast_state() -> void:
+	if _ws == null:
+		return
+	var peer_ids: Array = _ws.call("get_peer_ids")
+	for peer_id in peer_ids:
+		_ws_send_state(int(peer_id))
+
+func _claim_dict(player_name: String) -> Dictionary:
+	# reuse if same name
+	for pid in [1,2,3]:
+		if _player_slots[pid] != null:
+			var key: String = String(_player_slots[pid])
+			if _peer_info.has(key) and String(_peer_info[key]["name"]) == player_name:
+				_players[pid]["name"] = player_name
+				return {"ok": true, "player_id": pid, "hand": _hands.get(pid, []), "token": _slot_tokens[pid]}
+
+	# find free slot
+	for pid in [1,2,3]:
+		if _player_slots[pid] == null:
+			var token := _new_token()
+			var peer_key := token
+			_player_slots[pid] = peer_key
+			_peer_info[peer_key] = {"player_id": pid, "name": player_name}
+			_slot_tokens[pid] = token
+			_players[pid]["name"] = player_name
+			_log_event({"type":"join","player_id":pid,"name":player_name})
+			return {"ok": true, "player_id": pid, "hand": _hands.get(pid, []), "token": token}
+
+	return {"ok": false, "error": "lobby_full"}
+
+
+func _play_card_dict(pid: int, token: String, card: String, target: String) -> Dictionary:
+	if _run_over:
+		return {"ok": false, "error":"run_over"}
+
+	# validate
+	if pid < 1 or pid > 3:
+		return {"ok": false, "error":"bad_player"}
+	if token == "" or _slot_tokens.get(pid, "") != token:
+		return {"ok": false, "error":"bad_token"}
+	if pid != _turn_player:
+		return {"ok": false, "error":"not_your_turn", "turn_player": _turn_player}
+	if not _hands.get(pid, []).has(card):
+		return {"ok": false, "error":"illegal_card"}
+
+	match card:
+		"Strike":
+			var eid: int = _parse_enemy_tag(target)
+			if eid == -1: eid = _first_enemy_id()
+			if eid == -1: return {"ok": false, "error":"need_enemy_target"}
+			_damage_enemy(eid, 6)
+		"Zap":
+			var zeid: int = _parse_enemy_tag(target)
+			if zeid == -1: zeid = _first_enemy_id()
+			if zeid == -1: return {"ok": false, "error":"need_enemy_target"}
+			_damage_enemy(zeid, 4)
+		"Shield":
+			_add_shield(pid, 5)
+		"Heal":
+			_heal_player(pid, 5)
+		"Shield All":
+			for apid in [1,2,3]:
+				if _player_slots[apid] != null and bool(_players[apid]["alive"]):
+					_add_shield(apid, 5)
+		"Draw":
+			_draw(pid, 2)
+		_:
+			pass
+
+	# consume: hand -> discard (single instance)
+	var removed := false
+	for i in range(_hands[pid].size()):
+		if String(_hands[pid][i]) == card:
+			_hands[pid].remove_at(i)
+			removed = true
+			break
+	if removed:
+		_discards[pid].append(card)
+
+	_log_event({"type":"card_played","player_id":pid,"card":card,"target":target})
+
+	_maybe_advance_wave_or_win()
+	if _run_over:
+		var st_over := _state_payload(pid)
+		return {"ok": true, "state": st_over}
+
+	_next_turn_or_enemy_phase()
+
+	var st := _state_payload(pid)
+	return {"ok": true, "state": st}
+
+func _handle_ws_message(peer_id: int, msg: Dictionary) -> void:
+	var t := String(msg.get("type",""))
+	match t:
+		"ping":
+			_ws_send(peer_id, {"type":"pong"})
+		"claim":
+			var player_name := String(msg.get("name","Player")).substr(0,20)
+			var res := _claim_dict(player_name)
+			if not bool(res.get("ok", false)):
+				_ws_send(peer_id, {"type":"error","code":res.get("error","unknown")})
+				return
+			var pid: int = int(res["player_id"])
+			var tok: String = String(res["token"])
+			_ws_clients[peer_id] = {"player_id": pid, "token": tok}
+			_ws_send(peer_id, {"type":"claim_ok","player_id":pid,"token":tok,"hand":res.get("hand",[])})
+			_ws_send_state(peer_id)
+		"start":
+			_start_run()
+			_ws_broadcast_state()
+		"play_card":
+			var pid2: int = int(msg.get("player_id",0))
+			var tok2: String = String(msg.get("token",""))
+			var card := String(msg.get("card",""))
+			var target := String(msg.get("target","none"))
+			var r := _play_card_dict(pid2, tok2, card, target)
+			if not bool(r.get("ok", false)):
+				_ws_send(peer_id, {"type":"error","code":r.get("error","unknown")})
+				return
+			# Broadcast the authoritative state to everyone
+			_ws_broadcast_state()
+		"state_request":
+			_ws_send_state(peer_id)
+		_:
+			_ws_send(peer_id, {"type":"error","code":"unknown_type"})
+
+
+func _ws_probe() -> void:
+	print("--- WS Probe ---")
+	var exists: bool = ClassDB.class_exists("WebSocketServer")
+	print("Class exists? ", exists)
+	if not exists:
+		return
+
+	var tmp: Object = ClassDB.instantiate("WebSocketServer")
+	var inst_ok: bool = (tmp != null)
+	print("Instantiate ok? ", inst_ok)
+	if not inst_ok:
+		return
+
+	var has_listen: bool = tmp.has_method("listen")
+	print("Has listen()? ", has_listen)
+	if not has_listen:
+		return
+
+	# Try binding to an ephemeral port 0
+	var code: int = int(tmp.callv("listen", [0]))
+	print("listen(0) returned: ", code, " (OK==0)")
+	if code == OK:
+		if tmp.has_method("stop"):
+			tmp.call("stop")
+
+func _ws_probe_classes() -> void:
+	print("-- WS class map --")
+	print("WebSocketServer: ", ClassDB.class_exists("WebSocketServer"))
+	print("WebSocketPeer: ", ClassDB.class_exists("WebSocketPeer"))
+	print("WebSocketMultiplayerPeer: ", ClassDB.class_exists("WebSocketMultiplayerPeer"))

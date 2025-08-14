@@ -12,7 +12,15 @@
   let token = null;
   let turnPlayer = null;
   let runOver = false;
+  let lastVer = -1;
+  let pollDelay = 1500;
+  let pollTimer = null;
 
+  function schedulePoll(ms) {
+    if (pollTimer) clearTimeout(pollTimer);
+    pollDelay = ms;
+    pollTimer = setTimeout(refreshState, pollDelay);
+  }
   // --- HTTP helpers ---
   async function api(path, opts={}) {
     const res = await fetch(path, Object.assign({ headers: {'Content-Type':'application/json'} }, opts));
@@ -90,19 +98,35 @@
   function setStatus(text) { status.textContent = text; }
 
   function applyState(st) {
-    // st has turn_player, your_hand, players, enemies, run_over, wave, deck_count, discard_count
     turnPlayer = st.turn_player;
     runOver = !!st.run_over;
+
     renderEnemies(st.enemies || []);
     renderTargets(st.enemies || []);
     renderHand(st.your_hand || []);
+
     const yourTurn = (turnPlayer === playerId);
     const waveStr = st.wave ? ` — Wave ${st.wave}` : '';
     const piles = (st.deck_count!=null && st.discard_count!=null) ? ` — Deck ${st.deck_count} / Discard ${st.discard_count}` : '';
     const ro = runOver ? ' (Run Over)' : '';
     startBtn.textContent = runOver ? 'Restart Run' : 'Start Run';
     setStatus((playerId ? (yourTurn ? `Your turn (P${playerId})` : `Waiting… It’s Player ${turnPlayer}’s turn`) : 'Not joined') + waveStr + ro + piles);
+
+    // Adaptive polling: fast on changes / your turn, back off when idle
+    if (st.ver != null) {
+      if (st.ver !== lastVer) {
+        lastVer = st.ver;
+        const base = yourTurn ? 350 : 1200;
+        schedulePoll(base);
+      } else {
+        schedulePoll(Math.min(3000, pollDelay + 400));
+      }
+    } else {
+      // Fallback if ver is missing for any reason
+      schedulePoll(yourTurn ? 500 : 2000);
+    }
   }
+
 
   function renderEnemies(enemies) {
     enemiesEl.innerHTML = '';
@@ -203,6 +227,5 @@
 
   // Boot
   connectWS();
-  setInterval(refreshState, 2000); // fallback if WS isn’t pushing
-  // Lobby polling can stay if you want; state covers it now
+  schedulePoll(250);  // start light and adapt
 })();
